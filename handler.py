@@ -1,25 +1,25 @@
-"""RunPod serverless worker for Qwen3-TTS voice cloning (Daniel's voice).
+"""RunPod serverless worker for Qwen3-TTS voice cloning.
 
-Wraps the proven ValyrianTech FastAPI server (already in the base image): boots it,
-uploads the baked reference voice once, warms the model, then answers jobs.
+Contains NO personal data. The reference voice is supplied at runtime by the caller
+(as base64) and registered per-worker, so the image itself is safe to be public.
 
-Job input:  { "text": "...", "voice": "daniel" (optional), "speed": 1.0 (optional) }
-Job output: { "audio_base64": "<wav bytes b64>", "mime": "audio/wav", "voice": "daniel" }
+Wraps the proven ValyrianTech FastAPI server (in the base image): boots it, then:
+  warm/register: { "ref_b64": "<wav b64>", "ref_label": "daniel" }
+  synthesize:    { "text": "...", "voice": "daniel", "ref_b64": "<wav b64>", "speed": 1.0 }
+Output: { "audio_base64": "<wav b64>", "mime": "audio/wav", "voice": "daniel" }
 """
 import base64
 import os
 import subprocess
+import tempfile
 import time
 
 import requests
 import runpod
 
 BASE = "http://127.0.0.1:7860"
-REF_WAV = "/app/server/resources/daniel.wav"
-REF_LABEL = "daniel"
-
-# 1) Launch the FastAPI TTS server (start.sh runs uvicorn on 7860, loads the model).
 _server = subprocess.Popen(["/bin/bash", "/app/server/start.sh"])
+_registered = set()  # labels already uploaded to THIS worker
 
 
 def _wait_ready(timeout=900):
@@ -34,65 +34,58 @@ def _wait_ready(timeout=900):
     return False
 
 
-def _register_voice():
+def _register(ref_b64, label):
+    if not ref_b64 or label in _registered:
+        return label in _registered
     try:
-        with open(REF_WAV, "rb") as f:
+        raw = base64.b64decode(ref_b64)
+        p = os.path.join(tempfile.gettempdir(), f"{label}.wav")
+        with open(p, "wb") as f:
+            f.write(raw)
+        with open(p, "rb") as f:
             r = requests.post(
                 BASE + "/upload_audio/",
-                data={"audio_file_label": REF_LABEL},
-                files={"file": ("daniel.wav", f, "audio/wav")},
+                data={"audio_file_label": label},
+                files={"file": (f"{label}.wav", f, "audio/wav")},
                 timeout=180,
             )
-        print("[worker] voice register:", r.status_code, r.text[:120])
+        if r.status_code == 200:
+            _registered.add(label)
+            print(f"[worker] registered voice '{label}'")
+            return True
+        print("[worker] register http", r.status_code, r.text[:120])
     except Exception as e:
-        print("[worker] voice register failed:", e)
-
-
-def _warm():
-    # Force the model fully hot so the first real job is fast.
-    try:
-        requests.get(
-            BASE + "/synthesize_speech/",
-            params={"text": "Hola, listo.", "voice": REF_LABEL},
-            timeout=300,
-        )
-        print("[worker] warm synth done")
-    except Exception as e:
-        print("[worker] warm synth failed:", e)
+        print("[worker] register failed:", e)
+    return False
 
 
 print("[worker] waiting for TTS server...")
-if _wait_ready():
-    print("[worker] server up; registering voice + warming")
-    _register_voice()
-    _warm()
-else:
-    print("[worker] server did not become ready in time")
+_wait_ready()
+print("[worker] server ready")
 
 
 def handler(event):
     inp = event.get("input", {}) or {}
+    label = inp.get("ref_label") or inp.get("voice") or "daniel"
+    if inp.get("ref_b64"):
+        _register(inp["ref_b64"], label)
     text = (inp.get("text") or "").strip()
-    voice = inp.get("voice") or REF_LABEL
-    speed = inp.get("speed", 1.0)
-    # A warmup ping with no text just boots/keeps the worker hot.
     if not text:
-        return {"warmed": True}
+        # warm-up / register-only ping
+        return {"warmed": True, "registered": label in _registered}
+    if label not in _registered:
+        return {"error": f"voice '{label}' not registered on this worker; include ref_b64"}
     try:
         r = requests.get(
             BASE + "/synthesize_speech/",
-            params={"text": text, "voice": voice, "speed": speed},
+            params={"text": text, "voice": label, "speed": inp.get("speed", 1.0)},
             timeout=300,
         )
     except Exception as e:
         return {"error": f"synth request failed: {e}"}
     if r.status_code != 200:
         return {"error": f"synth http {r.status_code}: {r.text[:160]}"}
-    return {
-        "audio_base64": base64.b64encode(r.content).decode(),
-        "mime": "audio/wav",
-        "voice": voice,
-    }
+    return {"audio_base64": base64.b64encode(r.content).decode(), "mime": "audio/wav", "voice": label}
 
 
 runpod.serverless.start({"handler": handler})

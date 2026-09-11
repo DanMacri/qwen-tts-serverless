@@ -1,13 +1,11 @@
-# RunPod serverless worker for Daniel's Qwen3-TTS cloned voice.
-# Built on the proven ValyrianTech image (models already baked in), plus a thin
-# runpod handler that boots the server, registers the voice, and answers jobs.
+# RunPod serverless worker for Qwen3-TTS voice cloning. NO personal data in the image:
+# the reference voice is supplied at runtime by the caller. Safe to be public.
+# Built on the proven ValyrianTech image (Qwen model + whisper already baked in).
 FROM valyriantech/qwen3-tts_server:latest
 
 # runpod SDK + requests, into the image's venv.
 RUN /opt/venv/bin/pip install --no-cache-dir runpod requests
 
-# Bake Daniel's Spanish reference voice (sample 2).
-COPY daniel.wav /app/server/resources/daniel.wav
 COPY handler.py /app/server/handler.py
 
 WORKDIR /app/server
